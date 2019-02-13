@@ -162,7 +162,8 @@ namespace StackExchange.NetGain.WebSockets
                     }
 
 
-                    if ((failSockets++ % 100) == 0)
+                    if ((failSockets++ % 100) != 0)
+                        throw new InvalidOperationException("Request was not a web-socket upgrade request; connection: " + headers["Connection"] + ", upgrade: " + headers["Upgrade"]);
                     {
                         // DUMP HEADERS
                         var sb = new StringBuilder("Failing request: ").AppendLine(requestLine);
@@ -170,7 +171,7 @@ namespace StackExchange.NetGain.WebSockets
                         {
                             sb.AppendFormat("{0}:\t{1}", key, headers[key]).AppendLine();
                         }
-                        context?.Handler?.ErrorLog?.WriteLine(sb);
+                        context?.Handler?.Logger?.Error(sb);
                     }
                     throw new InvalidOperationException("Request was not a web-socket upgrade request; connection: " + headers["Connection"] + ", upgrade: " + headers["Upgrade"]);
                 }

@@ -10,8 +10,8 @@ namespace StackExchange.NetGain
     partial class TcpHandler
     {
         public object[] Extensions {
-            get { return context.Extensions; }
-            set { context.Extensions = value;}
+            get { return Context.Extensions; }
+            set { Context.Extensions = value;}
         }
         protected class ClientNode
         {
@@ -90,7 +90,7 @@ namespace StackExchange.NetGain
                             var tmpConn = connection;
                             if (tmpHandler == null || tmpConn == null) return false;
 
-                            tmpConn.Send(tmpHandler.context, next.Item1);
+                            tmpConn.Send(tmpHandler.Context, next.Item1);
                             sentCount++;
                             return true;
                         }
@@ -120,7 +120,7 @@ namespace StackExchange.NetGain
                     if (!isReady) throw new InvalidOperationException("Socket is not open");
                     outgoing.Enqueue(tuple);
                 }
-                connection.PromptToSend(handler.context);
+                connection.PromptToSend(handler.Context);
                 
             }
             internal int GetQueueLength()

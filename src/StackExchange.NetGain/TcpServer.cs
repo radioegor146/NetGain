@@ -1,19 +1,16 @@
 ﻿using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Collections.Specialized;
 using System.Net;
 using System.Net.Sockets;
 using System.Threading;
-using System.Threading.Tasks;
-using System.Linq;
-using System.Collections.Concurrent;
 
 namespace StackExchange.NetGain
 {
     public class TcpServer : TcpHandler
     {
-        private IMessageProcessor messageProcessor;
-        public IMessageProcessor MessageProcessor { get { return messageProcessor; } set { messageProcessor = value; } }
+        public IMessageProcessor MessageProcessor { get; set; }
 
         private Tuple<Socket, EndPoint>[] connectSockets;
         public TcpServer(int concurrentOperations = 0) : base(concurrentOperations)
@@ -32,7 +29,8 @@ namespace StackExchange.NetGain
             base.Close();
         }
         private volatile bool stopped;
-        public bool IsStopped {  get {  return stopped; } }
+        public bool IsStopped => stopped;
+
         public void Stop()
         {
             stopped = true;
@@ -42,12 +40,12 @@ namespace StackExchange.NetGain
                 timer = null;
             }
             var ctx = Context;
-            if (ctx != null) ctx.DoNotAccept();
+            ctx?.DoNotAccept();
 
             var proc = MessageProcessor;
             if (proc != null)
             {
-                Log?.WriteLine("{0}\tShutting down connections...", Connection.GetLogIdent());
+                Logger?.Info($"{Connection.GetLogIdent()}\tShutting down connections...");
                 foreach (var pair in allConnections)
                 {
                     var conn = pair.Value;
@@ -57,7 +55,7 @@ namespace StackExchange.NetGain
                         conn.GracefulShutdown(ctx); // then protocol
                     }
                     catch (Exception ex)
-                    { ErrorLog?.WriteLine("{0}\t{1}", Connection.GetIdent(conn), ex.Message); }
+                    { Logger?.Error(ex, Connection.GetIdent(conn)); }
                 }
                 Thread.Sleep(100);
             }
@@ -66,13 +64,12 @@ namespace StackExchange.NetGain
             {
                 var conn = pair.Value;
                 var socket = conn.Socket;
-                if(socket != null)
-                {
-                    try { socket.Close(); }
-                    catch (Exception ex) { ErrorLog?.WriteLine("{0}\t{1}", Connection.GetIdent(conn), ex.Message); }
-                    try { ((IDisposable)socket).Dispose(); }
-                    catch (Exception ex) { ErrorLog?.WriteLine("{0}\t{1}", Connection.GetIdent(conn), ex.Message); }
-                }
+                if (socket == null)
+                    continue;
+                try { socket.Close(); }
+                catch (Exception ex) { Logger?.Error(ex, Connection.GetIdent(conn)); }
+                try { ((IDisposable)socket).Dispose(); }
+                catch (Exception ex) { Logger?.Error(ex, Connection.GetIdent(conn)); }
             }
             if (connectSockets != null)
             {
@@ -85,62 +82,64 @@ namespace StackExchange.NetGain
                     try
                     {
                         endpoint = connectSocket.LocalEndPoint;
-                        Log?.WriteLine("{0}\tService stopping: {1}", Connection.GetConnectIdent(endpoint), endpoint);
+                        Logger?.Info($"{Connection.GetConnectIdent(endpoint)}\tService stopping: {endpoint}");
                         connectSocket.Close();
                     }
-                    catch (Exception ex) { ErrorLog?.WriteLine("{0}\t{1}", Connection.GetConnectIdent(endpoint), ex.Message); }
+                    catch (Exception ex) { Logger?.Error(ex, Connection.GetConnectIdent(endpoint)); }
                     try { ((IDisposable)connectSocket).Dispose(); }
-                    catch (Exception ex) { ErrorLog?.WriteLine("{0}\t{1}", Connection.GetConnectIdent(endpoint), ex.Message); }
+                    catch (Exception ex) { Logger?.Error(ex, Connection.GetConnectIdent(endpoint)); }
                 }
                 connectSockets = null;
-                var tmp = messageProcessor;
-                if(tmp != null) tmp.EndProcessor(Context);
+                var tmp = MessageProcessor;
+                tmp?.EndProcessor(Context);
             }
             WriteLog();
         }
-        ConcurrentDictionary<long,Connection> allConnections = new ConcurrentDictionary<long,Connection>();
+
+        private readonly ConcurrentDictionary<long,Connection> allConnections = new ConcurrentDictionary<long,Connection>();
         
-        private System.Threading.Timer timer;
+        private Timer timer;
+
         public int Backlog { get; set; }
         
-        private const int LogFrequency = 10000;
+        private const int logFrequency = 10000;
 
         public void Start(string configuration, params IPEndPoint[] endpoints)
         {
-            if (endpoints == null || endpoints.Length == 0) throw new ArgumentNullException("endpoints");
+            if (endpoints == null || endpoints.Length == 0) throw new ArgumentNullException(nameof(endpoints));
 
             if (connectSockets != null) throw new InvalidOperationException("Already started");
 
             connectSockets = new Tuple<Socket, EndPoint>[endpoints.Length];
-            var tmp = messageProcessor;
-            if(tmp != null) tmp.StartProcessor(Context, configuration);
-            for (int i = 0; i < endpoints.Length; i++)
+            var tmp = MessageProcessor;
+            tmp?.StartProcessor(Context, configuration);
+            for (var i = 0; i < endpoints.Length; i++)
             {
-                Log?.WriteLine("{0}\tService starting: {1}", Connection.GetConnectIdent(endpoints[i]), endpoints[i]);
+                Logger?.Info($"{Connection.GetConnectIdent(endpoints[i])}\tService starting: {endpoints[i]}");
                 EndPoint endpoint = endpoints[i];
-                Socket connectSocket = StartAcceptListener(endpoint);
+                var connectSocket = StartAcceptListener(endpoint);
                 if (connectSocket == null) throw new InvalidOperationException("Unable to start all endpoints");
                 connectSockets[i] = Tuple.Create(connectSocket, endpoint);
             }
 
-            timer = new System.Threading.Timer(Heartbeat, null, LogFrequency, LogFrequency);
+            timer = new Timer(Heartbeat, null, logFrequency, logFrequency);
         }
 
         private void ResurrectDeadListeners()
         {
-            if (IsStopped) return;
-            bool haveLock = false;
+            if (IsStopped)
+                return;
+            var haveLock = false;
             try
             {
                 Monitor.TryEnter(connectSockets, 100, ref haveLock);
-                if(haveLock)
+                if (!haveLock)
+                    return;
+                for (var i = 0; i < connectSockets.Length;i++)
                 {
-                    for(int i = 0; i < connectSockets.Length;i++)
+                    if (connectSockets[i].Item1 == null)
                     {
-                        if(connectSockets[i].Item1 == null)
-                        {
-                            ResurrectListenerAlreadyHaveLock(i);
-                        }
+                        ResurrectListenerAlreadyHaveLock(i);
                     }
                 }
             }
@@ -150,26 +149,19 @@ namespace StackExchange.NetGain
             }
         }
 
-        void ResurrectListenerAlreadyHaveLock(int i)
+        private void ResurrectListenerAlreadyHaveLock(int i)
         {
             var endpoint = connectSockets[i].Item2;
             try
             {
-                ErrorLog?.WriteLine("Restarting listener on " + endpoint + "...");
+                Logger?.Error($"Restarting listener on {endpoint}...");
                 var newSocket = StartAcceptListener(endpoint);
                 connectSockets[i] = Tuple.Create(newSocket, endpoint);
-                if (newSocket == null)
-                {
-                    ErrorLog?.WriteLine("Unable to restart listener on " + endpoint + "...");
-                }
-                else
-                {
-                    ErrorLog?.WriteLine("Restarted listener on " + endpoint + "...");
-                }
+                Logger?.Error(newSocket == null ? $"Unable to restart listener on {endpoint}..." : $"Restarted listener on {endpoint}...");
             }
             catch (Exception ex)
             {
-                ErrorLog?.WriteLine("Restart failed on " + endpoint + ":" + ex.Message);
+                Logger?.Error(ex, $"Restart failed on {endpoint}");
             }
         }
         protected override void OnAcceptFailed(SocketAsyncEventArgs args, Socket socket)
@@ -179,42 +171,40 @@ namespace StackExchange.NetGain
             {
                 base.OnAcceptFailed(args, socket);
 
-                ErrorLog?.WriteLine("Listener failure: " + args.SocketError);
+                Logger?.Error(new Exception(args.SocketError.ToString()), "Listener failure");
 
                 lock(connectSockets)
                 {
-                    for (int i = 0; i < connectSockets.Length; i++)
+                    for (var i = 0; i < connectSockets.Length; i++)
                     {
-                        if (ReferenceEquals(connectSockets[i].Item1, socket))
-                        {
-                            // clearly mark it as dead (makes it easy to spot in heartbeat)
-                            connectSockets[i] = Tuple.Create((Socket)null, connectSockets[i].Item2);
+                        if (!ReferenceEquals(connectSockets[i].Item1, socket))
+                            continue;
+                        // clearly mark it as dead (makes it easy to spot in heartbeat)
+                        connectSockets[i] = Tuple.Create((Socket)null, connectSockets[i].Item2);
 
-                            if (ImmediateReconnectListeners)
-                            {
-                                // try to resurrect promptly, but there's a good chance this will fail
-                                // and will be handled by heart-beat
-                                ResurrectListenerAlreadyHaveLock(i);
-                            }
+                        if (ImmediateReconnectListeners)
+                        {
+                            // try to resurrect promptly, but there's a good chance this will fail
+                            // and will be handled by heart-beat
+                            ResurrectListenerAlreadyHaveLock(i);
                         }
                     }
                 }
             }
-            catch(Exception ex)
+            catch (Exception ex)
             {
-                ErrorLog?.WriteLine("Epic fail in OnAcceptFailed: " + ex.Message);
+                Logger?.Error(ex, "Epic fail in OnAcceptFailed");
             }
         }
 
         public void KillAllListeners()
         {
-            lock(connectSockets)
+            lock (connectSockets)
             {
-                for (int i = 0; i < connectSockets.Length; i++)
+                foreach (var tuple in connectSockets)
                 {
-                    var tuple = connectSockets[i];
-                    var sock = tuple == null ? null : tuple.Item1;
-                    if (sock != null) sock.Close();
+                    var socket = tuple?.Item1;
+                    socket?.Close();
                 }
             }
         }
@@ -232,27 +222,27 @@ namespace StackExchange.NetGain
                 return connectSocket;
             } catch(Exception ex)
             {
-                ErrorLog?.WriteLine("Unable to start listener on " + endpoint.ToString() + ": " + ex.Message);
+                Logger?.Error($"Unable to start listener on {endpoint}: {ex.Message}");
                 return null;
             }
         }
 
         public override void OnAuthenticate(Connection connection, StringDictionary claims)
         {
-            var tmp = messageProcessor;
-            if(tmp != null) tmp.Authenticate(Context, connection, claims);
+            var tmp = MessageProcessor;
+            tmp?.Authenticate(Context, connection, claims);
             base.OnAuthenticate(connection, claims);
         }
         public override void OnAfterAuthenticate(Connection connection)
         {
-            var tmp = messageProcessor;
-            if (tmp != null) tmp.AfterAuthenticate(Context, connection);
+            var tmp = MessageProcessor;
+            tmp?.AfterAuthenticate(Context, connection);
             base.OnAfterAuthenticate(connection);
         }
         protected override void OnAccepted(Connection connection)
         {
-            var tmp = messageProcessor;
-            if (tmp != null) tmp.OpenConnection(Context, connection);
+            var tmp = MessageProcessor;
+            tmp?.OpenConnection(Context, connection);
             allConnections.TryAdd(connection.Id, connection);
             
             StartReading(connection);
@@ -260,8 +250,8 @@ namespace StackExchange.NetGain
 
         protected override void OnFlushed(Connection connection)
         {
-            var tmp = messageProcessor;
-            if (tmp != null) tmp.Flushed(Context, connection);
+            var tmp = MessageProcessor;
+            tmp?.Flushed(Context, connection);
             base.OnFlushed(connection);
         }
         protected override int GetCurrentConnectionCount()
@@ -270,19 +260,18 @@ namespace StackExchange.NetGain
         }
         protected internal override void OnClosing(Connection connection)
         {
-            Connection found;
-            if (allConnections.TryRemove(connection.Id, out found) && (object)found == (object)connection)
+            if (allConnections.TryRemove(connection.Id, out var found) && found == connection)
             {
-                var tmp = messageProcessor;
-                if (tmp != null) tmp.CloseConnection(Context, connection);
+                var tmp = MessageProcessor;
+                tmp?.CloseConnection(Context, connection);
                 // anything else we should do at connection shutdown
             }
             base.OnClosing(connection);
         }
         public override void OnReceived(Connection connection, object value)
         {
-            var proc = messageProcessor;
-            if(proc != null) proc.Received(Context, connection, value);
+            var proc = MessageProcessor;
+            proc?.Received(Context, connection, value);
             base.OnReceived(connection, value);
         }
 
@@ -291,7 +280,7 @@ namespace StackExchange.NetGain
         {
             lock(heartbeatLock) // don't want timer and manual invoke conflicting
             {
-                var tmp = messageProcessor;
+                var tmp = MessageProcessor;
                 if (tmp != null)
                 {
                     try
@@ -300,19 +289,16 @@ namespace StackExchange.NetGain
                     }
                     catch (Exception ex)
                     {
-                        ErrorLog?.WriteLine("{0}\tHeartbeat: {1}", Connection.GetHeartbeatIdent(), ex.Message);
+                        Logger?.Error(ex, $"{Connection.GetHeartbeatIdent()}\tHeartbeat");
                     }
                 }
                 ResurrectDeadListeners();
                 WriteLog();
             }
         }
-        private bool immediateReconnectListeners = true;
-        public bool ImmediateReconnectListeners
-        {
-            get { return immediateReconnectListeners; }
-            set { immediateReconnectListeners = value; }
-        }
+
+        public bool ImmediateReconnectListeners { get; set; } = true;
+
         private void Heartbeat(object sender)
         {
             Heartbeat();
@@ -322,11 +308,12 @@ namespace StackExchange.NetGain
         private int broadcastCounter;
         public override string BuildLog()
         {
-            var proc = messageProcessor;
-            string procStatus = proc == null ? "" : proc.ToString();
+            var proc = MessageProcessor;
+            var procStatus = proc?.ToString() ?? "";
             return base.BuildLog() + " bc:" + Thread.VolatileRead(ref broadcastCounter) + " " + procStatus;
         }
-        void BroadcastProcessIterator(IEnumerator<Connection> iterator, Func<Connection, object> selector, NetContext ctx)
+
+        private void BroadcastProcessIterator(IEnumerator<Connection> iterator, Func<Connection, object> selector, NetContext ctx)
         {
 
             bool cont;
@@ -352,8 +339,14 @@ namespace StackExchange.NetGain
                 }
                 catch
                 { // if an individual connection errors... KILL IT! and then gulp down the exception
-                    try { conn.Shutdown(ctx); }
-                    catch { }
+                    try
+                    {
+                        conn?.Shutdown(ctx);
+                    }
+                    catch
+                    {
+                        //ignored
+                    }
                 }
             } while (cont);
         }
@@ -362,17 +355,17 @@ namespace StackExchange.NetGain
         {
             // manually dual-threaded; was using Parallel.ForEach, but that caused unconstrained memory growth
             var ctx = Context;
-            using (var iter = allConnections.Values.GetEnumerator())
-            using (var workerDone = new AutoResetEvent(false))
-            {
-                ThreadPool.QueueUserWorkItem(x =>
+            using (var enumerator = allConnections.Values.GetEnumerator())
+                using (var workerDone = new AutoResetEvent(false))
                 {
-                    BroadcastProcessIterator(iter, selector, ctx);
-                    workerDone.Set();
-                });
-                BroadcastProcessIterator(iter, selector, ctx);
-                workerDone.WaitOne();
-            }
+                    ThreadPool.QueueUserWorkItem(x =>
+                    {
+                        BroadcastProcessIterator(enumerator, selector, ctx);
+                        workerDone.Set();
+                    });
+                    BroadcastProcessIterator(enumerator, selector, ctx);
+                    workerDone.WaitOne();
+                }
         }
 
 

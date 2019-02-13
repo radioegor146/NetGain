@@ -9,6 +9,8 @@ using System.Threading.Tasks;
 using System.Text;
 using System.Linq;
 using System.IO;
+using System.Management;
+using NLog;
 
 namespace StackExchange.NetGain
 {
@@ -16,8 +18,7 @@ namespace StackExchange.NetGain
     {
         public TcpService(string configuration, IMessageProcessor processor, IProtocolFactory factory)
         {
-            if(processor == null) throw new ArgumentNullException("processor");
-            this.processor = processor;
+            this.processor = processor ?? throw new ArgumentNullException(nameof(processor));
             this.factory = factory;
             Configuration = configuration;
             ServiceName = processor.Name;
@@ -39,56 +40,57 @@ namespace StackExchange.NetGain
         private IMessageProcessor processor;
         private IProtocolFactory factory;
 
-        public TextWriter ErrorLog { get; set; } = Console.Error;
-        public TextWriter Log { get; set; } = Console.Out;
         public void StartService()
         {
             if (processor == null) throw new ObjectDisposedException(GetType().Name);
-            if(server == null)
+            if (server != null) return;
+            var tmp = new TcpServer
             {
-                var tmp = new TcpServer() { Log = Log, ErrorLog = ErrorLog };
-                tmp.MessageProcessor = processor;
-                tmp.ProtocolFactory = factory;
-                tmp.Backlog = 100;
-                if (Interlocked.CompareExchange(ref server, tmp, null) == null)
+                MessageProcessor = processor,
+                ProtocolFactory = factory,
+                Backlog = 100
+            };
+            if (Interlocked.CompareExchange(ref server, tmp, null) == null)
+            {
+                ThreadPool.QueueUserWorkItem(delegate
                 {
-                    ThreadPool.QueueUserWorkItem(delegate
+                    try
                     {
-                        try
+                        if(!Environment.UserInteractive)
                         {
-                            if(!Environment.UserInteractive)
-                            {
-                                // why? you may ask; because I need win32 to acknowledge the service is started so we can query the names etc
-                                Thread.Sleep(250);
-                            }
-                                
-                            string svcName = GetServiceName();
-                            if (!string.IsNullOrEmpty(svcName))
-                            {
-                                ActualServiceName = svcName;
-                            }
-                            Configure();
-                            tmp.MaxIncomingQuota = MaxIncomingQuota;
-                            tmp.MaxOutgoingQuota = MaxOutgoingQuota;
-                            tmp.Start(Configuration, Endpoints);
-                        } catch (Exception ex)
-                        {
-                            ErrorLog?.WriteLine(ex.Message);
-                            Stop(); // argh!
+                            // why? you may ask; because I need win32 to acknowledge the service is started so we can query the names etc
+                            Thread.Sleep(250);
                         }
-                    });
+                                
+                        var serviceName = GetServiceName();
+                        if (!string.IsNullOrEmpty(serviceName))
+                        {
+                            ActualServiceName = serviceName;
+                        }
+                        Configure();
+                        tmp.MaxIncomingQuota = MaxIncomingQuota;
+                        tmp.MaxOutgoingQuota = MaxOutgoingQuota;
+                        tmp.Start(Configuration, Endpoints);
+                    } catch (Exception ex)
+                    {
+                        logger?.Error(ex);
+                        Stop(); // argh!
+                    }
+                });
                     
-                }
             }
         }
+
+        private Logger logger = LogManager.GetCurrentClassLogger();
 
         private string actualServiceName;
         public string ActualServiceName
         {
-            get { return actualServiceName ?? ServiceName;  }
-            set { actualServiceName = value; }
+            get => actualServiceName ?? ServiceName;
+            set => actualServiceName = value;
         }
-        static String GetServiceName() // http://stackoverflow.com/questions/1841790/how-can-a-windows-service-determine-its-servicename
+
+        private static string GetServiceName() // http://stackoverflow.com/questions/1841790/how-can-a-windows-service-determine-its-servicename
         {
             // Calling System.ServiceProcess.ServiceBase::ServiceNamea allways returns
             // an empty string,
@@ -98,13 +100,14 @@ namespace StackExchange.NetGain
             // the process contains a single service, if there are more than one services hosted
             // in the process you will have to do something else
 
-            int processId = System.Diagnostics.Process.GetCurrentProcess().Id;
-            String query = "SELECT * FROM Win32_Service where ProcessId = " + processId;
-            using (var searcher = new System.Management.ManagementObjectSearcher(query))
+            var processId = Process.GetCurrentProcess().Id;
+            var query = "SELECT * FROM Win32_Service where ProcessId = " + processId;
+            using (var searcher = new ManagementObjectSearcher(query))
             {
 
-                foreach (System.Management.ManagementObject queryObj in searcher.Get())
+                foreach (var o in searcher.Get())
                 {
+                    var queryObj = (ManagementObject) o;
                     return queryObj["Name"].ToString();
                 }
             }
@@ -113,10 +116,10 @@ namespace StackExchange.NetGain
         
         protected override void Dispose(bool disposing)
         {
-            if(disposing)
+            if (disposing)
             {
-                if(processor != null) processor.Dispose();
-                if(server != null) ((IDisposable) server).Dispose();
+                processor?.Dispose();
+                ((IDisposable) server)?.Dispose();
             }
             processor = null;
             factory = null;
@@ -142,7 +145,7 @@ namespace StackExchange.NetGain
         }
         private static void LogWhileDying(object ex, TextWriter errorLog)
         {
-            Exception typed = ex as Exception;
+            var typed = ex as Exception;
             errorLog?.WriteLine(typed == null ? Convert.ToString(ex) : typed.Message);
             if(typed != null)
             {
@@ -169,20 +172,20 @@ namespace StackExchange.NetGain
                 AppDomain.CurrentDomain.UnhandledException += (s, e) => LogWhileDying(e.ExceptionObject, errorLog);
                 string name = null;
                 bool uninstall = false, install = false, benchmark = false, hasErrors = false;
-                for (int i = 0; i < args.Length; i++ )
+                foreach (var argument in args)
                 {
-                    switch(args[i])
+                    switch(argument)
                     {
                         case "-u": uninstall = true; break;
                         case "-i": install = true; break;
                         case "-b": benchmark = true; break;
                         default:
-                            if(args[i].StartsWith("-n:"))
+                            if(argument.StartsWith("-n:"))
                             {
-                                name = args[i].Substring(3);
+                                name = argument.Substring(3);
                             } else
                             {
-                                errorLog?.WriteLine("Unknown argument: " + args[i]);
+                                errorLog?.WriteLine("Unknown argument: " + argument);
                                 hasErrors = true;
                             }
                             break;
@@ -202,13 +205,13 @@ namespace StackExchange.NetGain
                 {
                     log?.WriteLine("Uninstalling service...");
                     InstallerServiceName = name;
-                    ManagedInstallerClass.InstallHelper(new string[] { "/u", typeof(T).Assembly.Location });
+                    ManagedInstallerClass.InstallHelper(new [] { "/u", typeof(T).Assembly.Location });
                 }
                 if(install)
                 {
                     log?.WriteLine("Installing service...");
                     InstallerServiceName = name;
-                    ManagedInstallerClass.InstallHelper(new string[] { typeof(T).Assembly.Location });
+                    ManagedInstallerClass.InstallHelper(new [] { typeof(T).Assembly.Location });
                         
                 }
                 if(install || uninstall)
@@ -235,9 +238,7 @@ namespace StackExchange.NetGain
                 if (Environment.UserInteractive)// user facing
                 {
                     using (var messageProcessor = new T())
-                    using (var svc = new TcpService(configuration, messageProcessor, protocolFactory) {
-                        ErrorLog = errorLog, Log = log
-                    })
+                    using (var svc = new TcpService(configuration, messageProcessor, protocolFactory))
                     {
                         svc.Endpoints = endpoints;
                         if (!string.IsNullOrEmpty(name)) svc.ActualServiceName = name;
@@ -252,10 +253,10 @@ namespace StackExchange.NetGain
                 }
                 else
                 {
-                    var svc = new TcpService(configuration, new T(), protocolFactory) {
-                        ErrorLog = errorLog, Log = log
+                    var svc = new TcpService(configuration, new T(), protocolFactory)
+                    {
+                        Endpoints = endpoints
                     };
-                    svc.Endpoints = endpoints;
                     ServiceBase.Run(svc);
                     return 0;
                 }
@@ -268,8 +269,9 @@ namespace StackExchange.NetGain
         }
         internal class EchoProcessor : IMessageProcessor
         {
-            public string Name { get { return "Echo"; } }
-            public string Description { get { return "Garbage in, garbage out"; } }
+            public string Name => "Echo";
+            public string Description => "Garbage in, garbage out";
+
             void IMessageProcessor.Configure(TcpService service)
             {
                 service.Endpoints = new[] {new IPEndPoint(IPAddress.Loopback, 5999)};
@@ -290,57 +292,34 @@ namespace StackExchange.NetGain
 
             void IMessageProcessor.OnShutdown(NetContext context, Connection conn) { }
         }
-        internal void RunEchoBenchmark(int clients, int iterations, IProtocolFactory factory, TextWriter log)
+        internal void RunEchoBenchmark(int clients, int iterations, IProtocolFactory protocolFactory, TextWriter log)
         {
-            Thread[] threads = new Thread[clients];
-            int remaining = clients;
-            ManualResetEvent evt = new ManualResetEvent(false);
-            Stopwatch watch = new Stopwatch();
-            long opsPerSecond;
-            //ThreadStart work = () => RunEchoClient(iterations, ref remaining, evt, watch, factory);
-
-            //for (int i = 0; i < clients; i++)
-            //{
-            //    threads[i] = new Thread(work);
-            //}
-
-            //for (int i = 0; i < clients; i++)
-            //{
-            //    threads[i].Start();
-            //}
-            //for (int i = 0; i < clients; i++)
-            //{
-            //    threads[i].Join();
-            //}
-            //watch.Stop();
-            //opsPerSecond = watch.ElapsedMilliseconds == 0 ? -1 : (clients * iterations * 1000) / watch.ElapsedMilliseconds;
-            //log?.WriteLine("Total elapsed: {0}ms, {1}ops/s (individual clients)", watch.ElapsedMilliseconds, opsPerSecond);
-
-
+            Stopwatch watch;
             var endpoints = Enumerable.Repeat(new IPEndPoint(IPAddress.Loopback, 5999), clients).ToArray();
             var tasks = new Task[iterations];
-            byte[] message = new byte[1000];
+            var message = new byte[1000];
             new Random(123456).NextBytes(message);
             using(var clientGroup = new TcpClientGroup())
             {
                 clientGroup.MaxIncomingQuota = -1;
-                clientGroup.ProtocolFactory = factory;
+                clientGroup.ProtocolFactory = protocolFactory;
                 clientGroup.Open(endpoints);
                 watch = Stopwatch.StartNew();
                 
-                for(int i = 0 ; i < iterations ; i++)
+                for (var i = 0 ; i < iterations ; i++)
                 {
                     tasks[i] = clientGroup.Execute(message);
                 }
                 Task.WaitAll(tasks);
                 watch.Stop();
             }
-            opsPerSecond = watch.ElapsedMilliseconds == 0 ? -1 : (iterations * 1000) / watch.ElapsedMilliseconds;
+            var opsPerSecond = watch.ElapsedMilliseconds == 0 ? -1 : (iterations * 1000) / watch.ElapsedMilliseconds;
             log?.WriteLine("Total elapsed: {0}ms, {1}ops/s (grouped clients)", watch.ElapsedMilliseconds, opsPerSecond);
 
 
         }
-        void RunEchoClient(int iterations, ref int outstanding, ManualResetEvent evt, Stopwatch mainWatch, IProtocolFactory factory)
+
+        private void RunEchoClient(int iterations, ref int outstanding, EventWaitHandle evt, Stopwatch mainWatch, IProtocolFactory factory)
         {
 
             Task<object> last = null;
@@ -358,9 +337,9 @@ namespace StackExchange.NetGain
                 else evt.WaitOne();
 
                 var watch = Stopwatch.StartNew();
-                for (int i = 0; i < iterations; i++)
+                for (var i = 0; i < iterations; i++)
                     last = client.Execute(message);
-                last.Wait();
+                last?.Wait();
                 watch.Stop();
                 //log?.WriteLine("{0}ms", watch.ElapsedMilliseconds);
             }

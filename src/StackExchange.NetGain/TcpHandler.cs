@@ -6,16 +6,17 @@ using System.Collections.Specialized;
 using System.Net;
 using System.Text;
 using System.IO;
+using NLog;
 
 namespace StackExchange.NetGain
 {
     public partial class TcpHandler : IDisposable
     {
-        private readonly NetContext context;
-        protected NetContext Context { get { return context;  } }
+        protected NetContext Context { get; }
+
         public TcpHandler(int concurrentOperations = 0)
         {
-            context = new NetContext(AsyncHandler, this);
+            Context = new NetContext(AsyncHandler, this);
             if (concurrentOperations <= 0) concurrentOperations = 2 * Environment.ProcessorCount;
             this.concurrentOperations = new Semaphore(concurrentOperations, concurrentOperations);
             MutexTimeout = 10000;
@@ -47,8 +48,8 @@ namespace StackExchange.NetGain
                 {
                     tmp.EndConnect(asyncState); // checks for exception
                     var conn = ProtocolFactory.CreateConnection(endpoint) ?? new Connection();
-                    
-                    if (connectionInitializer != null) connectionInitializer(conn);
+
+                    connectionInitializer?.Invoke(conn);
 
                     conn.Socket = tmp;
                     var processor = ProtocolFactory.GetProcessor();
@@ -67,21 +68,20 @@ namespace StackExchange.NetGain
             }
             finally
             {
-                if (tmp != null) ((IDisposable)tmp).Dispose();
+                ((IDisposable) tmp)?.Dispose();
             }
         }
         protected void CloseConnection(Connection connection)
         {
-            var socket = connection == null ? null : connection.Socket;
-            if (socket != null)
-            {
-                try { socket.Shutdown(SocketShutdown.Both); }
-                catch { /* swallow */ }
-                try { socket.Close(); }
-                catch (Exception ex) { Trace.WriteLine(ex.Message); }
-                try { ((IDisposable)socket).Dispose(); }
-                catch (Exception ex) { Trace.WriteLine(ex.Message); }
-            }
+            var socket = connection?.Socket;
+            if (socket == null)
+                return;
+            try { socket.Shutdown(SocketShutdown.Both); }
+            catch { /* swallow */ }
+            try { socket.Close(); }
+            catch (Exception ex) { Trace.WriteLine(ex.Message); }
+            try { ((IDisposable)socket).Dispose(); }
+            catch (Exception ex) { Trace.WriteLine(ex.Message); }
         }
 
         void IDisposable.Dispose()
@@ -115,7 +115,7 @@ AcceptMore:
             } 
             catch(Exception ex)
             {
-                ErrorLog?.WriteLine("{0}\tStartAccept **CRITICAL**: {1}", Connection.GetIdent(args), ex.Message);
+                Logger?.Fatal(ex, $"{Connection.GetIdent(args)}\tStartAccept");
             }
         }
         private void AsyncHandler(object sender, SocketAsyncEventArgs args)
@@ -123,12 +123,11 @@ AcceptMore:
 #if VERBOSE
             Debug.WriteLine(string.Format("[{0}]\t{1}, {2}: {3} bytes", ToString(), args.LastOperation, args.SocketError, args.BytesTransferred));
 #endif
-            bool gotTheConch = false;
+            var gotTheConch = false;
             try
             {
-                Connection conn = args.UserToken as Connection;
-                bool hiPri = conn == null || conn.HighPriority;
-                gotTheConch = hiPri ? false : concurrentOperations.WaitOne(MutexTimeout);
+                var hiPri = !(args.UserToken is Connection conn) || conn.HighPriority;
+                gotTheConch = !hiPri && concurrentOperations.WaitOne(MutexTimeout);
                 if (gotTheConch || hiPri)
                 {
                     if (args.SocketError == SocketError.Success)
@@ -147,6 +146,8 @@ AcceptMore:
                             case SocketAsyncOperation.Disconnect:
                                 CloseSocket(args);
                                 break;
+                            default:
+                                throw new ArgumentOutOfRangeException();
                         }
                     }
                     else
@@ -161,7 +162,7 @@ AcceptMore:
                 }
                 else
                 {
-                    ErrorLog?.WriteLine("{0}\tForced to drop a connection because the server did not respond", Connection.GetIdent(args));
+                    Logger?.Error($"{Connection.GetIdent(args)}\tForced to drop a connection because the server did not respond");
                     CloseSocket(args);
                 }
             }
@@ -183,7 +184,7 @@ AcceptMore:
 
                 if (args.BytesTransferred != 0 && args.SocketError == SocketError.Success)
                 {
-                    if (conn != null) conn.Seen(); // update LastSeen
+                    conn?.Seen(); // update LastSeen
 
                     Interlocked.Add(ref totalBytesSent, args.BytesTransferred);
 #if DEBUG && LOG_OUTBOUND
@@ -192,7 +193,7 @@ AcceptMore:
                     var state = (Connection)args.UserToken;
                     if (args.BytesTransferred == args.Count)
                     {
-                        int toWrite = state.ReadOutgoing(context, args.Buffer, 0, args.Buffer.Length);
+                        var toWrite = state.ReadOutgoing(Context, args.Buffer, 0, args.Buffer.Length);
 
                         if(toWrite > 0)
                         {
@@ -201,7 +202,7 @@ AcceptMore:
                         } else
                         {
                             OnFlushed(conn);
-                            context.Recycle(args);
+                            Context.Recycle(args);
                         }
                     }
                     else
@@ -213,7 +214,8 @@ AcceptMore:
                 }
                 else
                 {
-                    ErrorLog?.WriteLine("{0}\tSocket closed: {1}", Connection.GetIdent(args), args.SocketError);
+                    Logger?.Error(new Exception($"Socket was closed: {args.SocketError}"),
+                        $"{Connection.GetIdent(args)}\tSocket closed");
                     CloseSocket(args);
                 }
             }
@@ -223,7 +225,7 @@ AcceptMore:
             }
             catch (Exception ex)
             {
-                ErrorLog?.WriteLine("{0}\tSend: {1}", Connection.GetIdent(args), ex.Message);
+                Logger?.Error(ex, $"{Connection.GetIdent(args)}\tSend");
                 CloseSocket(args);
             }
         }
@@ -233,18 +235,18 @@ AcceptMore:
         private int microBufferIndex;
         void SetFullBuffer(SocketAsyncEventArgs args)
         {
-            var buffer = context.GetBuffer();
+            var buffer = Context.GetBuffer();
             args.SetBuffer(buffer, 0, buffer.Length);
         }
         void SetMicroBuffer(SocketAsyncEventArgs args)
         {
             int index;
             byte[] buffer;
-            lock (context)
+            lock (Context)
             {
                 if (microBuffer == null)
                 {
-                    microBuffer = context.GetBuffer();
+                    microBuffer = Context.GetBuffer();
                 }
                 buffer = microBuffer;
                 index = microBufferIndex++;
@@ -262,42 +264,37 @@ AcceptMore:
         public virtual void OnReceived(Connection connection, object value)
         {
             var handler = Received;
-            bool handled = false;
+            var handled = false;
             if (handler != null)
             {
-                var msg = new Message(context, connection, value);
+                var msg = new Message(Context, connection, value);
                 handler(msg);
                 handled = msg.IsHandled;
             }
-            if (!handled)
+
+            if (handled)
+                return;
+            if (connection.UserToken is ClientNode node)
             {
-                var node = connection.UserToken as ClientNode;
-                if (node != null)
-                {
-                    node.SetResult(value);
-                }
+                node.SetResult(value);
             }
-
-
         }
         protected void StartReading(Connection connection)
         {
-            if (connection.CanRead)
-            {
-                var socket = connection.Socket;
-                var args = Context.GetSocketArgs();
-                args.UserToken = connection;
-                SetMicroBuffer(args);
-                // set a **tiny portion** of a shard buffer until we have reason to think they are sending us data
-                if (!socket.ReceiveAsync(args)) 
-                    ReceiveCompleted(args);
-            }
+            if (!connection.CanRead)
+                return;
+            var socket = connection.Socket;
+            var args = Context.GetSocketArgs();
+            args.UserToken = connection;
+            SetMicroBuffer(args);
+            // set a **tiny portion** of a shard buffer until we have reason to think they are sending us data
+            if (!socket.ReceiveAsync(args)) 
+                ReceiveCompleted(args);
         }
 
         protected internal virtual bool RequestOutgoing(Connection connection)
         {
-            var node = connection.UserToken as ClientNode;
-            if(node != null)
+            if (connection.UserToken is ClientNode node)
             {
                 return node.RequestOutgoing();
             }
@@ -309,22 +306,22 @@ AcceptMore:
             SocketAsyncEventArgs args = null;
             try
             {
-                var buffer = context.GetBuffer();
-                int toWrite = connection.ReadOutgoing(context, buffer, 0, buffer.Length);
+                var buffer = Context.GetBuffer();
+                var toWrite = connection.ReadOutgoing(Context, buffer, 0, buffer.Length);
                 if (toWrite > 0)
                 {
-                    args = context.GetSocketArgs();
+                    args = Context.GetSocketArgs();
                     args.UserToken = connection;
                     args.SetBuffer(buffer, 0, toWrite);
                     if (!connection.Socket.SendAsync(args)) SendCompleted(args);
                 } else
                 {
-                    context.Recycle(buffer);
+                    Context.Recycle(buffer);
                 }
             }
             catch (Exception ex)
             {
-                ErrorLog?.WriteLine("{0}\tStart-send: {1}", Connection.GetIdent(args), ex.Message);
+                Logger?.Error(ex, $"{Connection.GetIdent(args)}\tStart-send");
                 if (args != null) CloseSocket(args);
             }
         }
@@ -339,11 +336,11 @@ MoreToRead:
 
                 if (args.BytesTransferred > 0 && args.SocketError == SocketError.Success)
                 {
-                    if (state != null) state.Seen(); // update LastSeen
+                    state?.Seen(); // update LastSeen
 
                     Interlocked.Add(ref totalBytesReceived, args.BytesTransferred);
 
-                    if (MaxIncomingQuota > 0 && state.IncomingBufferedLength + args.BytesTransferred > MaxIncomingQuota)
+                    if (state != null && (MaxIncomingQuota > 0 && state.IncomingBufferedLength + args.BytesTransferred > MaxIncomingQuota))
                     {
                         throw new InvalidOperationException("Incoming buffer exceeded");
                     }
@@ -352,46 +349,51 @@ MoreToRead:
                     Debug.WriteLine("Received: " + BitConverter.ToString(args.Buffer, args.Offset, args.BytesTransferred));
 #endif
 
-                    state.AppendIncoming(context, args.Buffer, args.Offset, args.BytesTransferred);
-                    var tmp = args.Buffer;
-                    bool recycle = args.Count == tmp.Length; // we pwn it
-                    args.SetBuffer(null, 0, 0);
-                    if(recycle) context.Recycle(tmp);
-
-                    int msgCount;
-                    bool keepReading = state.ProcessBufferedData(context, out msgCount);
-                    if (msgCount > 0) Interlocked.Add(ref totalMessages, msgCount);
-
-                    if(!state.CanRead)
-                    { // allows eager shutdown of reads
-                        if(state.IncomingBufferedLength != 0)
-                        {
-                            throw new InvalidOperationException("Extra data discovered on an outbound-only socket");
-                        }
-                        keepReading = false;
-                    }
-                    if (keepReading)
+                    if (state != null)
                     {
-                        if(state.IncomingBufferedLength == 0)
-                        { 
-                            // use a fraction of a buffer until we think there is something useful to read
-                            SetMicroBuffer(args);
-                        }
-                        else
-                        { 
-                            // we know we're expecting more, since we have some buffered that we can't yet handle
-                            SetFullBuffer(args);
+                        state.AppendIncoming(Context, args.Buffer, args.Offset, args.BytesTransferred);
+                        var tmp = args.Buffer;
+                        var recycle = args.Count == tmp.Length; // we pwn it
+                        args.SetBuffer(null, 0, 0);
+                        if (recycle) Context.Recycle(tmp);
+
+                        var keepReading = state.ProcessBufferedData(Context, out var msgCount);
+                        if (msgCount > 0) Interlocked.Add(ref totalMessages, msgCount);
+
+                        if (!state.CanRead)
+                        {
+                            // allows eager shutdown of reads
+                            if (state.IncomingBufferedLength != 0)
+                            {
+                                throw new InvalidOperationException("Extra data discovered on an outbound-only socket");
+                            }
+
+                            keepReading = false;
                         }
 
-                        try
+                        if (keepReading)
                         {
-                            if (state.CanRead && !state.Socket.ReceiveAsync(args)) goto MoreToRead;
-                        }
-                        catch (ObjectDisposedException)
-                        { 
-                            // can get this if the client disconnects and the socket gets shut down
-                            Debug.WriteLine("EOF/close: " + state);
-                            CloseSocket(args);
+                            if (state.IncomingBufferedLength == 0)
+                            {
+                                // use a fraction of a buffer until we think there is something useful to read
+                                SetMicroBuffer(args);
+                            }
+                            else
+                            {
+                                // we know we're expecting more, since we have some buffered that we can't yet handle
+                                SetFullBuffer(args);
+                            }
+
+                            try
+                            {
+                                if (state.CanRead && !state.Socket.ReceiveAsync(args)) goto MoreToRead;
+                            }
+                            catch (ObjectDisposedException)
+                            {
+                                // can get this if the client disconnects and the socket gets shut down
+                                Debug.WriteLine("EOF/close: " + state);
+                                CloseSocket(args);
+                            }
                         }
                     }
                 }
@@ -408,7 +410,7 @@ MoreToRead:
             }
             catch (Exception ex)
             {
-                ErrorLog?.WriteLine("{0}\tReceive: {1}", Connection.GetIdent(args), ex.Message);
+                Logger?.Error(ex, $"{Connection.GetIdent(args)}\tReceive");
                 CloseSocket(args);
             }
         }
@@ -458,7 +460,7 @@ MoreToRead:
             }
             catch (Exception ex)
             {
-                ErrorLog?.WriteLine("{0}\tAccept: {1}", Connection.GetIdent(args), ex.Message);
+                Logger?.Error(ex, $"{Connection.GetIdent(args)}\tAccept");
                 Kill(newSocket);
             }
             if (startMore)
@@ -467,13 +469,12 @@ MoreToRead:
             }
         }
 
-        static void Kill(Socket socket)
+        private static void Kill(Socket socket)
         {
-            if (socket != null)
-            {
-                try { socket.Close(); } catch { }
-                try { socket.Dispose(); } catch { }
-            }
+            if (socket == null)
+                return;
+            try { socket.Close(); } catch { /* ignored */ }
+            try { socket.Dispose(); } catch { /* ignored */ }
         }
 
         protected virtual void OnAccepted(Connection connection)
@@ -482,8 +483,8 @@ MoreToRead:
         }
         protected internal virtual void OnClosing(Connection connection)
         {
-            var node = connection.UserToken as ClientNode;
-            if(node != null) node.Close();
+            if (connection.UserToken is ClientNode node)
+                node.Close();
         }
         private void CloseSocket(SocketAsyncEventArgs args)
         {
@@ -496,12 +497,12 @@ MoreToRead:
                 }
                 catch (Exception ex)
                 {
-                    ErrorLog?.WriteLine("{0}\tClose: {1}", Connection.GetIdent(args), ex.Message);
+                    Logger?.Error(ex, $"{Connection.GetIdent(args)}\tClose");
                 }
                 
             }
             
-            Socket socket = state == null ? args.AcceptSocket : state.Socket;
+            var socket = state == null ? args.AcceptSocket : state.Socket;
             if (socket != null)
             {
                 try { socket.Shutdown(SocketShutdown.Send); }
@@ -512,7 +513,7 @@ MoreToRead:
                 catch { /* swallow */ }
             }
             // release the various objects and buffers
-            context.Recycle(args);
+            Context.Recycle(args);
         }
 
         private int totalConnections;
@@ -523,20 +524,18 @@ MoreToRead:
             return 0;
         }
 
-        public TextWriter Log { get; set; } = Console.Out;
-        public TextWriter ErrorLog { get; set; } = Console.Error;
+        public Logger Logger { get; set; } = LogManager.GetCurrentClassLogger();
+
         protected void WriteLog()
         {
-            var log = Log;
-            if (log != null)
-            {
-                string newLog = BuildLog();
-                if (newLog != lastLog)
-                {
-                    lastLog = newLog;
-                    log.WriteLine("{0}\t{1}", Connection.GetLogIdent(), newLog);
-                }
-            }
+            var log = Logger;
+            if (log == null)
+                return;
+            var newLog = BuildLog();
+            if (newLog == lastLog)
+                return;
+            lastLog = newLog;
+            log.Info($"{Connection.GetLogIdent()}\t{newLog}");
         }
         public virtual string BuildLog()
         {
@@ -546,21 +545,19 @@ MoreToRead:
                  ts = Interlocked.Read(ref totalBytesSent),
                  to = Interlocked.Read(ref totalMessages),
                  mem;
-            string health = IsAtCapacity ? ", MAXED" : "";
+            var health = IsAtCapacity ? ", MAXED" : "";
             using(var proc = Process.GetCurrentProcess())
             {
                 mem = proc.PrivateMemorySize64 / (1024 * 1024);
             }
-            StringBuilder sb = new StringBuilder();
+            var sb = new StringBuilder();
             sb.AppendFormat("con:{0}/{1} i/o kB:{2}/{3} ops:{4} mem: {5}MB {6}", cc, tc, tr / 1024, ts / 1024, to, mem, health);
             var ext = Context.Extensions;
-            if (ext != null)
+            if (ext == null)
+                return sb.ToString();
+            foreach (var o in ext)
             {
-                for (int i = 0; i < ext.Length; i++)
-                {
-                    object o = ext[i];
-                    if (o != null) sb.Append(' ').Append(o);
-                }
+                if (o != null) sb.Append(' ').Append(o);
             }
             return sb.ToString();
         }
@@ -568,7 +565,7 @@ MoreToRead:
         {
          get
          {
-             bool taken = false;
+             var taken = false;
              try
              {
                  taken = concurrentOperations.WaitOne(0);
@@ -586,7 +583,7 @@ MoreToRead:
 
         public void WriteLog(string line, Connection connection = null)
         {
-            Log?.WriteLine("{0}\t{1}", connection == null ? Connection.GetAuditTimestamp() : Connection.GetIdent(connection), line);
+            Logger?.Info($"{(connection == null ? Connection.GetAuditTimestamp() : Connection.GetIdent(connection))}\t{line}");
         }
     }
     internal sealed class CloseSocketException : Exception { }
