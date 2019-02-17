@@ -7,9 +7,14 @@
     <Copyright>Stack Exchange Inc. 2018</Copyright>
     <PacakgeProjectUrl>https://github.com/StackExchange/NetGain</PacakgeProjectUrl>
     <PacakgeLicenseUrl>https://raw.github.com/StackExchange/NetGain/master/LICENSE</PacakgeLicenseUrl>
-    <TargetFrameworks>net462</TargetFrameworks>
+    <TargetFrameworks>net45</TargetFrameworks>
     <AllowedOutputExtensionsInPackageBuildOutputFolder>$(AllowedOutputExtensionsInPackageBuildOutputFolder);.pdb</AllowedOutputExtensionsInPackageBuildOutputFolder>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <Configurations>Debug;Release;x64</Configurations>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(TargetFramework)|$(Platform)'=='Release|net462|AnyCPU'">
+    <DefineConstants>TRACE;RELEASE;NET45</DefineConstants>
+    <OutputPath>bin\Release\net45\</OutputPath>
   </PropertyGroup>
   <ItemGroup>
     <Reference Include="System" />
